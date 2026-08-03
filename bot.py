@@ -353,8 +353,21 @@ def get_spontaneous_chance(seconds_since_last: float) -> float:
 # Обработчики команд
 # ---------------------------------------------------------------------------
 
+# Бот задуман для групповых чатов. В личных сообщениях вместо обычного
+# диалога отправляем это сообщение с инструкцией.
+PRIVATE_CHAT_REDIRECT_MESSAGE = (
+    "Привет! 💛 Я работаю только в групповых чатах — добавь меня в свою "
+    "группу, и я буду общаться там со всеми вместе.\n\n"
+    "Просто добавь бота в чат и напиши там /start, чтобы начать!"
+)
+
+
 @dp.message(CommandStart())
 async def handle_start(message: Message):
+    if message.chat.type == "private":
+        await message.answer(PRIVATE_CHAT_REDIRECT_MESSAGE)
+        return
+
     clear_history(message.chat.id, message.from_user.id)
     await message.answer(
         "Привет, товарищ! ✨ Я Ангела — прилетела, чтобы дарить тепло и "
@@ -390,9 +403,9 @@ async def handle_stats(message: Message):
 # ---------------------------------------------------------------------------
 
 def should_respond(message: Message, text: str, seconds_since_last: float) -> bool:
-    # в личных сообщениях отвечаем всегда
-    if message.chat.type == "private":
-        return True
+    # эта функция вызывается только для групповых чатов — в личке бот
+    # теперь отвечает редиректом ещё до вызова should_respond (см.
+    # handle_message)
 
     # ответили реплаем на сообщение бота
     is_reply_to_bot = (
@@ -493,6 +506,13 @@ async def handle_new_members(message: Message):
 @dp.message(F.text)
 async def handle_message(message: Message):
     user_text = message.text
+
+    if message.chat.type == "private":
+        # /start и /reset уже отфильтрованы своими собственными
+        # обработчиками (aiogram сначала проверяет команды), сюда
+        # долетает только обычный текст в личке
+        await message.answer(PRIVATE_CHAT_REDIRECT_MESSAGE)
+        return
 
     # замеряем паузу ДО обновления, иначе всегда получим "0 секунд с
     # последнего сообщения" (этого же самого)
