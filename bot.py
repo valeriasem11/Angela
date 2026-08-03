@@ -334,12 +334,12 @@ async def handle_message(message: Message):
         response = await ai_client.chat.completions.create(
             model=MODEL_NAME,
             messages=api_messages,
-            max_tokens=200,  # физически обрезает слишком длинные ответы
+            max_tokens=350,  # достаточно, чтобы фразы не обрывались на середине
         )
         answer = response.choices[0].message.content
     except Exception:
         logger.exception("Ошибка при обращении к AITUNNEL/DeepSeek API")
-        await message.answer(
+        await message.reply(
             "Упс, не получилось получить ответ от ИИ. Попробуй ещё раз "
             "чуть позже — возможно, исчерпан лимит запросов или "
             "закончился баланс на AITUNNEL."
@@ -351,7 +351,7 @@ async def handle_message(message: Message):
     history.append({"role": "assistant", "text": answer})
     save_history(user_id, history)
 
-    await message.answer(answer)
+    await message.reply(answer)
 
 
 # ---------------------------------------------------------------------------
