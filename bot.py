@@ -97,12 +97,14 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# tools=["google_search_retrieval"] позволяет модели самой гуглить перед
-# ответом — полезно для актуальных данных о патчах и балансе героев
+# ВРЕМЕННО ОТКЛЮЧЕНО: используем инструмент google_search_retrieval для
+# актуальных данных, но на бесплатном тарифе он может требовать
+# привязанный платёжный аккаунт. Если базовая генерация без поиска
+# заработает — вернём поиск и разберёмся с этим отдельно.
 model = genai.GenerativeModel(
     MODEL_NAME,
     system_instruction=SYSTEM_PROMPT,
-    tools="google_search_retrieval",
+    # tools="google_search_retrieval",
 )
 
 bot = Bot(token=TELEGRAM_TOKEN)
