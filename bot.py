@@ -282,7 +282,7 @@ async def handle_message(message: Message):
         response = await ai_client.chat.completions.create(
             model=MODEL_NAME,
             messages=api_messages,
-            max_tokens=350,  # достаточно, чтобы фразы не обрывались на середине
+            max_tokens=500,  # запас, чтобы фразы точно не обрывались
         )
         answer = response.choices[0].message.content
     except Exception:
