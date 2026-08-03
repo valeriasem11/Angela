@@ -110,9 +110,12 @@ HERO_RECENT_FACTS = (
 
 SYSTEM_PROMPT = SYSTEM_PROMPT + HERO_ROSTER_BY_ROLE + HERO_RECENT_FACTS
 
-# Сколько последних сообщений хранить в истории на пользователя в каждом чате
-# (чтобы не упираться в лимиты токенов и не тратить лишнее)
-MAX_HISTORY_MESSAGES = 20
+# Сколько последних сообщений хранить в общей истории чата (теперь память
+# общая на весь чат, а не по каждому пользователю отдельно — сюда попадают
+# ВСЕ сообщения в группе, даже те, на которые Ангела не ответила, чтобы
+# она не теряла нить общего разговора). Значение чуть выше, чем раньше,
+# потому что теперь сюда попадают реплики сразу нескольких людей.
+MAX_HISTORY_MESSAGES = 30
 
 # deepseek-v4-flash-0731 — дешёвая и быстрая модель (28₽/56₽ за 1M
 # токенов), хорошо подходит для чат-бота. Название должно точно совпадать
@@ -213,17 +216,10 @@ def init_db():
     conn.close()
 
 
-def _thread_key(chat_id: int, user_id: int) -> str:
-    # отдельная память на каждую пару (чат, пользователь) — значит, память
-    # в личке и в разных группах у одного и того же человека не смешивается
-    return f"{chat_id}:{user_id}"
-
-
-def get_history(chat_id: int, user_id: int) -> list:
+def get_history(chat_id: int) -> list:
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT messages FROM history WHERE thread_key = ?",
-        (_thread_key(chat_id, user_id),),
+        "SELECT messages FROM history WHERE thread_key = ?", (str(chat_id),)
     ).fetchone()
     conn.close()
     if row:
@@ -231,27 +227,32 @@ def get_history(chat_id: int, user_id: int) -> list:
     return []
 
 
-def save_history(chat_id: int, user_id: int, history: list):
+def save_history(chat_id: int, history: list):
     # обрезаем историю, чтобы не росла бесконечно
     trimmed = history[-MAX_HISTORY_MESSAGES:]
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO history (thread_key, messages) VALUES (?, ?) "
         "ON CONFLICT(thread_key) DO UPDATE SET messages = excluded.messages",
-        (_thread_key(chat_id, user_id), json.dumps(trimmed, ensure_ascii=False)),
+        (str(chat_id), json.dumps(trimmed, ensure_ascii=False)),
     )
     conn.commit()
     conn.close()
 
 
-def clear_history(chat_id: int, user_id: int):
+def clear_history(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "DELETE FROM history WHERE thread_key = ?",
-        (_thread_key(chat_id, user_id),),
-    )
+    conn.execute("DELETE FROM history WHERE thread_key = ?", (str(chat_id),))
     conn.commit()
     conn.close()
+
+
+def format_history_entry_for_api(entry: dict) -> dict:
+    # для сообщений пользователей добавляем имя прямо в текст — так модель
+    # видит, КТО что сказал, и может ориентироваться в многоголосой беседе
+    if entry["role"] == "assistant":
+        return {"role": "assistant", "content": entry["text"]}
+    return {"role": "user", "content": f"{entry['name']}: {entry['text']}"}
 
 
 def check_and_record_rate_limit(user_id: int) -> bool:
@@ -368,7 +369,7 @@ async def handle_start(message: Message):
         await message.answer(PRIVATE_CHAT_REDIRECT_MESSAGE)
         return
 
-    clear_history(message.chat.id, message.from_user.id)
+    clear_history(message.chat.id)
     await message.answer(
         "Привет, товарищ! ✨ Я Ангела — прилетела, чтобы дарить тепло и "
         "поддержку! 💖 Пиши мне что угодно, я всегда рядом и буду "
@@ -379,7 +380,7 @@ async def handle_start(message: Message):
 
 @dp.message(Command("reset"))
 async def handle_reset(message: Message):
-    clear_history(message.chat.id, message.from_user.id)
+    clear_history(message.chat.id)
     await message.answer("Готово, начинаем нашу дружбу с чистого листа! 🎀💛")
 
 
@@ -428,7 +429,7 @@ def should_respond(message: Message, text: str, seconds_since_last: float) -> bo
 # Общая логика: получить ответ от ИИ и отправить его пользователю
 # ---------------------------------------------------------------------------
 
-async def generate_and_reply(message: Message, user_text: str):
+async def generate_and_reply(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -440,14 +441,13 @@ async def generate_and_reply(message: Message, user_text: str):
         )
         return
 
-    history = get_history(chat_id, user_id)
+    # история уже содержит только что добавленное сообщение (оно
+    # логируется в handle_message ДО вызова этой функции)
+    history = get_history(chat_id)
 
-    # собираем сообщения в формате OpenAI/DeepSeek: системный промпт +
-    # история + новое сообщение
     api_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for item in history:
-        api_messages.append({"role": item["role"], "content": item["text"]})
-    api_messages.append({"role": "user", "content": user_text})
+        api_messages.append(format_history_entry_for_api(item))
 
     await bot.send_chat_action(chat_id, "typing")
 
@@ -468,10 +468,9 @@ async def generate_and_reply(message: Message, user_text: str):
         )
         return
 
-    # сохраняем обновлённую историю (роли "user"/"assistant" — стандарт OpenAI)
-    history.append({"role": "user", "text": user_text})
-    history.append({"role": "assistant", "text": answer})
-    save_history(chat_id, user_id, history)
+    # добавляем ответ Ангелы в общую историю чата
+    history.append({"role": "assistant", "name": "Ангела", "text": answer})
+    save_history(chat_id, history)
 
     await message.reply(answer)
 
@@ -514,15 +513,25 @@ async def handle_message(message: Message):
         await message.answer(PRIVATE_CHAT_REDIRECT_MESSAGE)
         return
 
+    chat_id = message.chat.id
+    sender_name = message.from_user.first_name or message.from_user.username or "Собеседник"
+
     # замеряем паузу ДО обновления, иначе всегда получим "0 секунд с
     # последнего сообщения" (этого же самого)
-    seconds_since_last = get_seconds_since_last_message(message.chat.id)
+    seconds_since_last = get_seconds_since_last_message(chat_id)
     should_answer = should_respond(message, user_text, seconds_since_last)
-    update_chat_activity(message.chat.id)
+    update_chat_activity(chat_id)
+
+    # логируем ВСЕ сообщения в общую историю чата, даже если Ангела не
+    # будет отвечать — иначе она не будет знать, что вообще происходило
+    # в чате между её собственными репликами
+    history = get_history(chat_id)
+    history.append({"role": "user", "name": sender_name, "text": user_text})
+    save_history(chat_id, history)
 
     if not should_answer:
         return
-    await generate_and_reply(message, user_text)
+    await generate_and_reply(message)
 
 
 # ---------------------------------------------------------------------------
