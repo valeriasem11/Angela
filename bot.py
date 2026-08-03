@@ -5,6 +5,7 @@ import random
 import re
 import sqlite3
 import json
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -112,7 +113,7 @@ HERO_RECENT_FACTS = (
 
 SYSTEM_PROMPT = SYSTEM_PROMPT + HERO_ROSTER_BY_ROLE + HERO_RECENT_FACTS
 
-# Сколько последних сообщений хранить в истории на пользователя
+# Сколько последних сообщений хранить в истории на пользователя в каждом чате
 # (чтобы не упираться в лимиты токенов и не тратить лишнее)
 MAX_HISTORY_MESSAGES = 20
 
@@ -133,6 +134,10 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 # шанс "влезть" в разговор самой (чтобы не отвечать на каждую реплику).
 GROUP_SPONTANEOUS_CHANCE = 0.03  # 3% шанс написать что-то самой
 NAME_PATTERN = re.compile(r"ангел\w*", re.IGNORECASE)
+
+# --- Лимит сообщений (защита от спама и от неожиданных трат на API) ---
+RATE_LIMIT_MESSAGES_PER_HOUR = 20
+RATE_LIMIT_WINDOW_SECONDS = 3600
 
 # id бота — узнаём при старте (нужно, чтобы определять реплаи на бота)
 BOT_ID: int | None = None
@@ -159,7 +164,7 @@ dp = Dispatcher()
 
 
 # ---------------------------------------------------------------------------
-# База данных: хранение истории переписки по каждому пользователю
+# База данных: история переписки (отдельно на каждый чат) + лимит сообщений
 # ---------------------------------------------------------------------------
 
 def init_db():
@@ -167,8 +172,24 @@ def init_db():
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS history (
-            user_id INTEGER PRIMARY KEY,
+            thread_key TEXT PRIMARY KEY,
             messages TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            user_id INTEGER PRIMARY KEY,
+            timestamps TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_stats (
+            chat_id INTEGER PRIMARY KEY,
+            total_messages INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -176,10 +197,17 @@ def init_db():
     conn.close()
 
 
-def get_history(user_id: int) -> list:
+def _thread_key(chat_id: int, user_id: int) -> str:
+    # отдельная память на каждую пару (чат, пользователь) — значит, память
+    # в личке и в разных группах у одного и того же человека не смешивается
+    return f"{chat_id}:{user_id}"
+
+
+def get_history(chat_id: int, user_id: int) -> list:
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT messages FROM history WHERE user_id = ?", (user_id,)
+        "SELECT messages FROM history WHERE thread_key = ?",
+        (_thread_key(chat_id, user_id),),
     ).fetchone()
     conn.close()
     if row:
@@ -187,24 +215,89 @@ def get_history(user_id: int) -> list:
     return []
 
 
-def save_history(user_id: int, history: list):
+def save_history(chat_id: int, user_id: int, history: list):
     # обрезаем историю, чтобы не росла бесконечно
     trimmed = history[-MAX_HISTORY_MESSAGES:]
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO history (user_id, messages) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET messages = excluded.messages",
-        (user_id, json.dumps(trimmed, ensure_ascii=False)),
+        "INSERT INTO history (thread_key, messages) VALUES (?, ?) "
+        "ON CONFLICT(thread_key) DO UPDATE SET messages = excluded.messages",
+        (_thread_key(chat_id, user_id), json.dumps(trimmed, ensure_ascii=False)),
     )
     conn.commit()
     conn.close()
 
 
-def clear_history(user_id: int):
+def clear_history(chat_id: int, user_id: int):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+    conn.execute(
+        "DELETE FROM history WHERE thread_key = ?",
+        (_thread_key(chat_id, user_id),),
+    )
     conn.commit()
     conn.close()
+
+
+def check_and_record_rate_limit(user_id: int) -> bool:
+    """Возвращает True, если пользователь ещё не превысил лимит сообщений
+    в час, и записывает текущий запрос. Возвращает False, если лимит
+    исчерпан (и ничего не записывает)."""
+    now = time.time()
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT timestamps FROM rate_limits WHERE user_id = ?", (user_id,)
+    ).fetchone()
+
+    timestamps = json.loads(row[0]) if row else []
+    # оставляем только те метки времени, что попадают в последний час
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]
+
+    if len(timestamps) >= RATE_LIMIT_MESSAGES_PER_HOUR:
+        conn.close()
+        return False
+
+    timestamps.append(now)
+    conn.execute(
+        "INSERT INTO rate_limits (user_id, timestamps) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET timestamps = excluded.timestamps",
+        (user_id, json.dumps(timestamps)),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def record_chat_message(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO chat_stats (chat_id, total_messages) VALUES (?, 1) "
+        "ON CONFLICT(chat_id) DO UPDATE SET total_messages = total_messages + 1",
+        (chat_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_chat_stats(chat_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT total_messages FROM chat_stats WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+async def is_chat_admin(message: Message) -> bool:
+    # в личных сообщениях это и так личный чат пользователя с ботом —
+    # ограничивать тут нечего
+    if message.chat.type == "private":
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        logger.exception("Не удалось проверить права администратора")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +306,7 @@ def clear_history(user_id: int):
 
 @dp.message(CommandStart())
 async def handle_start(message: Message):
-    clear_history(message.from_user.id)
+    clear_history(message.chat.id, message.from_user.id)
     await message.answer(
         "Привет, товарищ! ✨ Я Ангела — прилетела, чтобы дарить тепло и "
         "поддержку! 💖 Пиши мне что угодно, я всегда рядом и буду "
@@ -224,20 +317,33 @@ async def handle_start(message: Message):
 
 @dp.message(Command("reset"))
 async def handle_reset(message: Message):
-    clear_history(message.from_user.id)
+    clear_history(message.chat.id, message.from_user.id)
     await message.answer("Готово, начинаем нашу дружбу с чистого листа! 🎀💛")
+
+
+@dp.message(Command("stats"))
+async def handle_stats(message: Message):
+    if not await is_chat_admin(message):
+        await message.reply(
+            "Эта команда доступна только администраторам чата 💛"
+        )
+        return
+
+    total_messages = get_chat_stats(message.chat.id)
+    await message.answer(
+        "📊 Статистика этого чата:\n"
+        f"Сообщений от Ангелы: {total_messages}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Проверка: должна ли Ангела вообще отвечать на это сообщение
 # ---------------------------------------------------------------------------
 
-def should_respond(message: Message) -> bool:
+def should_respond(message: Message, text: str) -> bool:
     # в личных сообщениях отвечаем всегда
     if message.chat.type == "private":
         return True
-
-    text = message.text or ""
 
     # ответили реплаем на сообщение бота
     is_reply_to_bot = (
@@ -256,18 +362,22 @@ def should_respond(message: Message) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Обработка обычных текстовых сообщений
+# Общая логика: получить ответ от ИИ и отправить его пользователю
 # ---------------------------------------------------------------------------
 
-@dp.message(F.text)
-async def handle_message(message: Message):
-    if not should_respond(message):
+async def generate_and_reply(message: Message, user_text: str):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if not check_and_record_rate_limit(user_id):
+        await message.reply(
+            "Ой, что-то мы разогнались! 💛 Давай немного отдохнём и "
+            "продолжим через часок — так я смогу уделить внимание всем "
+            "по-честному."
+        )
         return
 
-    user_id = message.from_user.id
-    user_text = message.text
-
-    history = get_history(user_id)
+    history = get_history(chat_id, user_id)
 
     # собираем сообщения в формате OpenAI/DeepSeek: системный промпт +
     # история + новое сообщение
@@ -276,7 +386,7 @@ async def handle_message(message: Message):
         api_messages.append({"role": item["role"], "content": item["text"]})
     api_messages.append({"role": "user", "content": user_text})
 
-    await bot.send_chat_action(message.chat.id, "typing")
+    await bot.send_chat_action(chat_id, "typing")
 
     try:
         response = await ai_client.chat.completions.create(
@@ -285,6 +395,7 @@ async def handle_message(message: Message):
             max_tokens=500,  # запас, чтобы фразы точно не обрывались
         )
         answer = response.choices[0].message.content
+        record_chat_message(chat_id)
     except Exception:
         logger.exception("Ошибка при обращении к AITUNNEL/DeepSeek API")
         await message.reply(
@@ -297,9 +408,44 @@ async def handle_message(message: Message):
     # сохраняем обновлённую историю (роли "user"/"assistant" — стандарт OpenAI)
     history.append({"role": "user", "text": user_text})
     history.append({"role": "assistant", "text": answer})
-    save_history(user_id, history)
+    save_history(chat_id, user_id, history)
 
     await message.reply(answer)
+
+
+# ---------------------------------------------------------------------------
+# Приветствие новых участников группы (без обращения к ИИ — простые
+# шаблоны с вариациями, чтобы не тратить токены на каждое вступление)
+# ---------------------------------------------------------------------------
+
+WELCOME_TEMPLATES = [
+    "Привет, {name}! 💛 Рада видеть тебя в нашей команде.",
+    "О, {name} присоединился! Добро пожаловать, будем дружить.",
+    "Привет, {name}! Здесь тепло и безопасно — располагайся.",
+    "{name}, привет! Заходи, у нас как раз завариваю чай для всех.",
+]
+
+
+@dp.message(F.new_chat_members)
+async def handle_new_members(message: Message):
+    for new_member in message.new_chat_members:
+        if new_member.id == BOT_ID:
+            continue  # не приветствуем саму себя, если бота добавили в чат
+        name = new_member.first_name or "друг"
+        greeting = random.choice(WELCOME_TEMPLATES).format(name=name)
+        await message.answer(greeting)
+
+
+# ---------------------------------------------------------------------------
+# Обработка обычных текстовых сообщений
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text)
+async def handle_message(message: Message):
+    user_text = message.text
+    if not should_respond(message, user_text):
+        return
+    await generate_and_reply(message, user_text)
 
 
 # ---------------------------------------------------------------------------
