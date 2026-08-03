@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from dotenv import load_dotenv
+import httpx
 from openai import AsyncOpenAI
 
 # ---------------------------------------------------------------------------
@@ -158,10 +159,14 @@ SYSTEM_PROMPT = SYSTEM_PROMPT + HERO_ROSTER_BY_ROLE + HERO_RECENT_FACTS
 # (чтобы не упираться в лимиты токенов и не тратить лишнее)
 MAX_HISTORY_MESSAGES = 20
 
-# deepseek-v4-flash — дешёвая и быстрая модель, хорошо подходит для чат-бота.
+# deepseek-v4-flash-0731 — дешёвая и быстрая модель (28₽/56₽ за 1M
+# токенов), хорошо подходит для чат-бота. Название должно точно совпадать
+# со значением в разделе "Разрешённые модели" настроек ключа AITUNNEL —
+# если поменяешь модель тут, поменяй и там (или очисти список моделей
+# в настройках ключа, чтобы разрешить любую).
 # Если захочется более сильных ответов — можно поменять на "deepseek-v4-pro"
 # (дороже, но качественнее в сложных рассуждениях).
-MODEL_NAME = "deepseek-v4-flash"
+MODEL_NAME = "deepseek-v4-flash-0731"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 
@@ -179,10 +184,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # AITUNNEL — российский агрегатор с оплатой в рублях и OpenAI-совместимым
-# API, поэтому используем обычный клиент openai, просто с другим base_url
+# API, поэтому используем обычный клиент openai, просто с другим base_url.
+#
+# Клиент httpx создаём вручную (без параметра proxies) — так библиотека
+# openai не пытается сама передать несовместимый аргумент в httpx, если
+# на хостинге стоит более новая версия httpx, чем ожидает openai.
+_http_client = httpx.AsyncClient()
+
 ai_client = AsyncOpenAI(
     api_key=AITUNNEL_API_KEY,
     base_url="https://api.aitunnel.ru/v1/",
+    http_client=_http_client,
 )
 
 bot = Bot(token=TELEGRAM_TOKEN)
