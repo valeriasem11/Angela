@@ -265,12 +265,20 @@ def format_history_entry_for_api(entry: dict, is_current: bool = False) -> dict:
     # сейчас, а не кто-то из более ранней истории.
     if entry["role"] == "assistant":
         return {"role": "assistant", "content": entry["text"]}
-    if is_current:
-        return {
-            "role": "user",
-            "content": f"{entry['name']} (пишет тебе прямо сейчас): {entry['text']}",
-        }
-    return {"role": "user", "content": f"{entry['name']}: {entry['text']}"}
+
+    prefix = (
+        f"{entry['name']} (пишет тебе прямо сейчас)" if is_current else entry["name"]
+    )
+
+    # если сообщение было отправлено как реплай на чьё-то конкретное
+    # сообщение — явно указываем это модели, а не заставляем угадывать
+    # по общей истории, о чём вообще речь
+    reply_to = entry.get("reply_to")
+    reply_note = ""
+    if reply_to:
+        reply_note = f" [в ответ на сообщение {reply_to['name']}: \"{reply_to['text']}\"]"
+
+    return {"role": "user", "content": f"{prefix}{reply_note}: {entry['text']}"}
 
 
 def check_and_record_rate_limit(user_id: int) -> bool:
@@ -545,7 +553,25 @@ async def handle_message(message: Message):
     # будет отвечать — иначе она не будет знать, что вообще происходило
     # в чате между её собственными репликами
     history = get_history(chat_id)
-    history.append({"role": "user", "name": sender_name, "text": user_text})
+    entry = {"role": "user", "name": sender_name, "text": user_text}
+
+    # если это реплай на чьё-то конкретное сообщение — сохраняем, на что
+    # именно отвечали, чтобы модель не путала тему по общей истории
+    reply_msg = message.reply_to_message
+    if reply_msg is not None and reply_msg.from_user is not None:
+        quoted_text = reply_msg.text or reply_msg.caption
+        if quoted_text:
+            quoted_name = (
+                "Ангела"
+                if reply_msg.from_user.id == BOT_ID
+                else (reply_msg.from_user.first_name or reply_msg.from_user.username or "кто-то")
+            )
+            entry["reply_to"] = {
+                "name": quoted_name,
+                "text": quoted_text[:200],  # обрезаем, чтобы не раздувать контекст
+            }
+
+    history.append(entry)
     save_history(chat_id, history)
 
     if not should_answer:
