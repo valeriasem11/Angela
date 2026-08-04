@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import random
@@ -6,10 +7,11 @@ import re
 import sqlite3
 import json
 import time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
 from dotenv import load_dotenv
 import httpx
 from openai import AsyncOpenAI
@@ -199,6 +201,10 @@ NAME_PATTERN = re.compile(r"ангел\w*", re.IGNORECASE)
 RATE_LIMIT_MESSAGES_PER_HOUR = 20
 RATE_LIMIT_WINDOW_SECONDS = 3600
 
+# ID пользователя, которому доступна команда /chats (список бесед, где
+# известна Ангела).
+ADMIN_USER_ID = 828533150
+
 # id бота — узнаём при старте (нужно, чтобы определять реплаи на бота)
 BOT_ID: int | None = None
 
@@ -258,6 +264,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS chat_activity (
             chat_id INTEGER PRIMARY KEY,
             last_message_ts REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS known_chats (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at REAL NOT NULL
         )
         """
     )
@@ -381,6 +397,32 @@ async def is_chat_admin(message: Message) -> bool:
         return False
 
 
+def upsert_known_chat(chat_id: int, title: str, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO known_chats (chat_id, title, status, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, "
+        "status = excluded.status, updated_at = excluded.updated_at",
+        (chat_id, title, status, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_known_chats() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT chat_id, title, status, updated_at FROM known_chats "
+        "ORDER BY updated_at DESC"
+    ).fetchall()
+    conn.close()
+    return [
+        {"chat_id": r[0], "title": r[1], "status": r[2], "updated_at": r[3]}
+        for r in rows
+    ]
+
+
 def get_seconds_since_last_message(chat_id: int) -> float:
     """Сколько секунд прошло с последнего сообщения в чате. Если записи
     ещё нет (первое сообщение вообще) — считаем, что тишина была долгой."""
@@ -461,6 +503,61 @@ async def handle_stats(message: Message):
         "📊 Статистика этого чата:\n"
         f"Сообщений от Ангелы: {total_messages}"
     )
+
+
+@dp.message(Command("chats"))
+async def handle_chats(message: Message):
+    # доступно только тебе и только в личных сообщениях с ботом — для
+    # всех остальных команда как будто не существует (не подсказываем
+    # её наличие и не отвечаем вообще)
+    if message.chat.type != "private" or message.from_user.id != ADMIN_USER_ID:
+        return
+
+    chats = get_known_chats()
+    if not chats:
+        await message.answer(
+            "Пока не знаю ни одного чата 🌸 Список пополняется по мере "
+            "того, как в чатах происходит активность или меняется мой "
+            "статус (добавили/удалили/сделали админом)."
+        )
+        return
+
+    status_icons = {
+        "member": "✅",
+        "administrator": "✅",
+        "creator": "✅",
+        "restricted": "⚠️",
+        "left": "❌",
+        "kicked": "❌",
+    }
+
+    lines = [f"🤖 Беседы, где известна Ангела ({len(chats)})"]
+    for chat in chats:
+        icon = status_icons.get(chat["status"], "❔")
+        title = html.escape(chat["title"])
+        updated_str = datetime.fromtimestamp(chat["updated_at"]).strftime(
+            "%d.%m.%Y %H:%M"
+        )
+        lines.append(
+            f"\n{icon} <b>{title}</b>\n"
+            f"ID: <code>{chat['chat_id']}</code> · статус: {chat['status']} · "
+            f"обновлено: {updated_str}"
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# Отслеживание чатов, где присутствует бот (для команды /chats) —
+# срабатывает, когда бота добавляют, удаляют, делают админом и т.д.
+# ---------------------------------------------------------------------------
+
+@dp.my_chat_member()
+async def handle_my_chat_member(event: ChatMemberUpdated):
+    chat = event.chat
+    status = event.new_chat_member.status
+    title = chat.title or chat.full_name or str(chat.id)
+    upsert_known_chat(chat.id, title, status)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +677,10 @@ async def handle_message(message: Message):
 
     chat_id = message.chat.id
     sender_name = message.from_user.first_name or message.from_user.username or "Собеседник"
+
+    # обновляем запись о чате по факту активности — так /chats показывает
+    # актуальное время последнего сообщения, а не только момент добавления
+    upsert_known_chat(chat_id, message.chat.title or str(chat_id), "member")
 
     # замеряем паузу ДО обновления, иначе всегда получим "0 секунд с
     # последнего сообщения" (этого же самого)
